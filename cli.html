@@ -291,7 +291,7 @@
       await killSession();
       showTerm(true, name);
     }
-    stat(name === "grok" ? "starting grok → jwrangle…" : ("starting " + name + "…"));
+    stat("starting " + name + "…");
     term.reset();
     const r = await post("open", { name, cols: term.cols || 80, rows: term.rows || 24 });
     if (!r.ok) {
@@ -303,7 +303,7 @@
     sid = r.id;
     sessionStorage.setItem("scanner-pty", sid);
     killBtn.hidden = false;
-    const label = name === "grok" ? (name + " · jwrangle · " + r.cwd) : (name + " · " + r.cwd);
+    const label = name + (r.cwd ? (" · " + r.cwd) : "");
     stat(label);
     attach(sid, 0);
     term.focus();
@@ -322,7 +322,7 @@
     inp.focus();
   };
 
-  /* ── boot: list allowlisted commands; default = grok → jwrangle resume ── */
+  /* boot: list allowlisted commands */
   (async function boot() {
     const procs = document.getElementById("procs");
     if (!SERVED) {
@@ -352,7 +352,7 @@
       ensureTerm(); showTerm(true);
       try { fit.fit(); } catch (_) {}
       sid = live.id;
-      stat(live.name + " · reattached · jwrangle");
+      stat(live.name + " · reattached");
       attach(sid, 0);
       return;
     }
@@ -363,11 +363,11 @@
       try { fit.fit(); } catch (_) {}
       sid = liveGrok.id;
       sessionStorage.setItem("scanner-pty", sid);
-      stat("grok · reattached · jwrangle");
+      stat("grok · reattached");
       attach(sid, 0);
       return;
     }
-    // Default open: grok resumes jwrangle (server forces -r day sid / -c + cwd)
+    // Default open: first allowlisted command
     if ((st.commands || []).includes("grok")) {
       await openProc("grok");
     } else {
