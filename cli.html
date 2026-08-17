@@ -1,0 +1,501 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Scanner terminal</title>
+<link rel="stylesheet" href="/cli/vendor/xterm.css">
+<!--
+  The board's docked terminal. Two modes in one pane:
+    cmd   — whitelisted verbs against this scanner's API (no process, always safe)
+    grok / pwsh / cmd — a REAL console process spawned and owned by the scan server
+                        over /api/pty/* (allowlisted commands, token-gated).
+  xterm.js is vendored under vendor/ — nothing is fetched from the network at runtime.
+-->
+<style>
+  :root {
+    --bg:#080c11;
+    --ink:#9ad8ff;          /* light blue body text */
+    --ink-hi:#ffffff;       /* white highlights */
+    --dim:#6a9bbb;
+    --accent:#7ec8ff;
+    --err:#ff8a8a;
+    --line:#18222c;
+  }
+  * { box-sizing: border-box; }
+  /* display:flex on #cmdview would otherwise beat the UA rule for [hidden] */
+  [hidden] { display: none !important; }
+  html, body { height: 100%; height: 100%; margin: 0; }
+  html { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.5 "JetBrains Mono", "Cascadia Mono", Consolas, ui-monospace, monospace;
+    display: flex; flex-direction: column;
+    min-height: 100%;
+    height: 100%;
+    overflow: hidden;
+  }
+  body.embed header { display: none; }
+  body.embed { background: transparent; }
+  header, #modes {
+    flex: none; display: flex; gap: 8px; align-items: center;
+    padding: 6px 10px; border-bottom: 1px solid var(--line); color: var(--dim); font-size: 12px;
+  }
+  /* narrow dock: one scrolling row, never a wrapped stack of buttons */
+  #modes { gap: 5px; padding: 5px 8px; flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
+  #modes::-webkit-scrollbar { display: none; }
+  #procs { display: flex; gap: 5px; }
+  header b { color: var(--ink-hi); font-weight: 700; letter-spacing: .5px; }
+  #dot { width: 8px; height: 8px; border-radius: 50%; background: var(--err); flex: none; }
+  #dot.up { background: #51cf66; }
+  #modes button {
+    background: transparent; color: var(--dim); border: 1px solid var(--line);
+    border-radius: 5px; padding: 2px 8px; font: inherit; font-size: 12px; cursor: pointer;
+  }
+  #modes button:hover:not(:disabled) { color: var(--ink-hi); border-color: var(--accent); }
+  #modes button.on { color: var(--ink-hi); border-color: var(--accent); background: rgba(126,200,255,.1); }
+  #modes button:disabled { opacity: .4; cursor: default; }
+  #tstat { margin-left: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+  #tstat.err { color: var(--err); }
+
+  #cmdview { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+  #out { flex: 1 1 auto; overflow: auto; padding: 8px 10px; white-space: pre-wrap; word-break: break-word; color: var(--ink); }
+  .echo { color: var(--ink-hi); } .err { color: var(--err); } .muted { color: var(--dim); }
+  form { flex: none; display: flex; gap: 8px; align-items: center; padding: 6px 10px; border-top: 1px solid var(--line); }
+  .ps1 { color: var(--ink-hi); flex: none; }
+  input { flex: 1 1 auto; background: transparent; border: 0; outline: 0; color: var(--ink); font: inherit; caret-color: var(--ink-hi); }
+  input::placeholder { color: var(--dim); }
+  ::selection { background: rgba(255,255,255,.28); color: var(--ink-hi); }
+
+  #termwrap { flex: 1 1 auto; min-height: 0; padding: 0; display: flex; flex-direction: column; }
+  #termhost { flex: 1 1 auto; width: 100%; min-height: 0; height: 100%; }
+  .xterm { height: 100%; }
+  .xterm-viewport::-webkit-scrollbar { width: 8px; }
+  .xterm-viewport::-webkit-scrollbar-thumb { background: #2a4a60; border-radius: 4px; }
+  .xterm-viewport::-webkit-scrollbar-thumb:hover { background: #3d6a88; }
+  body.drop-path { outline: 2px solid var(--accent); outline-offset: -2px; }
+  body.drop-path #tstat::before { content: "drop = paste path · "; color: var(--accent); }
+
+  /* Title-only until hover (standalone companion only; embed dock skips this) */
+  .cth-titlebar {
+    display: none;
+    flex: none;
+    padding: 10px 12px;
+    font-weight: 700;
+    font-size: 14px;
+    color: var(--accent);
+    letter-spacing: .4px;
+    background: #0c1218;
+  }
+  .cth-titlebar .hint { color: var(--dim); font-weight: 400; font-size: 11px; margin-left: 10px; }
+  html.cth-on:not(.cth-open) body {
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  html.cth-on:not(.cth-open) body > *:not(.cth-titlebar) { display: none !important; }
+  html.cth-on:not(.cth-open) .cth-titlebar {
+    display: flex;
+    align-items: center;
+    flex: 1 1 auto;
+    min-height: 100%;
+    width: 100%;
+    border: 0;
+    cursor: default;
+  }
+  html.cth-on.cth-open .cth-titlebar { display: none; }
+</style>
+
+<div class="cth-titlebar" aria-hidden="true">Scanner CLI<span class="hint">hover to expand</span></div>
+<header><span id="dot"></span><b>scanner terminal</b><span>whitelist + real pty · owned by the scanner</span></header>
+
+<div id="modes">
+  <button data-mode="cmd">cmd</button>
+  <span style="color:var(--line)">|</span>
+  <span id="procs"></span>
+  <span id="tstat"></span>
+  <button id="kill" hidden title="end this terminal">×</button>
+</div>
+
+<div id="cmdview">
+  <div id="out"></div>
+  <form id="f" autocomplete="off"><span class="ps1">&gt;</span><input id="in" spellcheck="false" placeholder="help"></form>
+</div>
+
+<div id="termwrap" hidden><div id="termhost"></div></div>
+
+<script src="/cli/vendor/xterm.js"></script>
+<script src="/cli/vendor/addon-fit.js"></script>
+<script>
+  const API = (location.protocol === "file:" || !location.port) ? "http://127.0.0.1:8765" : "";
+  const TOKEN = "__PTY_TOKEN__";                       // filled in by win_serve
+  const SERVED = TOKEN.indexOf("__PTY") !== 0;         // false when opened from disk
+  const EMBED = new URLSearchParams(location.search).has("embed");
+  if (EMBED) document.body.classList.add("embed");
+
+  const out = document.getElementById("out"), inp = document.getElementById("in"), dot = document.getElementById("dot");
+  const cmdview = document.getElementById("cmdview"), termwrap = document.getElementById("termwrap");
+  const tstat = document.getElementById("tstat"), killBtn = document.getElementById("kill");
+  const stat = (t, bad) => { tstat.textContent = t || ""; tstat.className = bad ? "err" : ""; };
+
+  /* ── cmd mode: whitelisted verbs ─────────────────────────────────────── */
+  const hist = JSON.parse(localStorage.getItem("scanner-cli-hist") || "[]");
+  let hp = hist.length;
+
+  function put(text, cls) {
+    const d = document.createElement("div");
+    if (cls) d.className = cls;
+    d.textContent = text;
+    out.appendChild(d);
+    out.scrollTop = out.scrollHeight;
+  }
+
+  async function send(line) {
+    if (line.trim().toLowerCase() === "clear") { out.textContent = ""; return; }
+    put("> " + line, "echo");
+    try {
+      const r = await fetch(API + "/api/cmd", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ line })
+      });
+      const j = await r.json();
+      dot.classList.add("up");
+      (j.lines || []).forEach(l => put(l, j.ok ? "" : "err"));
+      if (!(j.lines || []).length) put("(no output)", "muted");
+    } catch (e) {
+      dot.classList.remove("up");
+      put("server unreachable — is the scanner running on :8765?", "err");
+    }
+  }
+
+  document.getElementById("f").addEventListener("submit", e => {
+    e.preventDefault();
+    const line = inp.value;
+    if (!line.trim()) return;
+    hist.push(line);
+    while (hist.length > 100) hist.shift();
+    hp = hist.length;
+    localStorage.setItem("scanner-cli-hist", JSON.stringify(hist));
+    inp.value = "";
+    send(line);
+  });
+
+  inp.addEventListener("keydown", e => {
+    if (e.key === "ArrowUp" && hp > 0) { inp.value = hist[--hp] || ""; e.preventDefault(); }
+    else if (e.key === "ArrowDown") { hp = Math.min(hp + 1, hist.length); inp.value = hist[hp] || ""; e.preventDefault(); }
+    else if (e.key === "l" && e.ctrlKey) { out.textContent = ""; e.preventDefault(); }
+  });
+
+  /* ── pty mode: a real console owned by the scanner ────────────────────── */
+  let term = null, fit = null, es = null, sid = null;
+  const dec = new TextDecoder("utf-8");
+  const b64bytes = s => { const b = atob(s), a = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) a[i] = b.charCodeAt(i); return a; };
+  const b64 = s => btoa(String.fromCharCode(...new TextEncoder().encode(s)));
+  const post = (p, body) => fetch(API + "/api/pty/" + p, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(Object.assign({ token: TOKEN }, body))
+  }).then(r => r.json());
+
+  let activeProc = "grok";
+  function showTerm(on, procName) {
+    if (procName) activeProc = procName;
+    cmdview.hidden = on; termwrap.hidden = !on;
+    document.querySelector('[data-mode="cmd"]').classList.toggle("on", !on);
+    document.querySelectorAll("#procs button").forEach(b => {
+      b.classList.toggle("on", on && b.textContent === activeProc);
+    });
+    // Kill stays available while a session is live — even if the user flipped
+    // back to cmd mode. Hiding it was the main "can't close terminals" trap.
+    killBtn.hidden = !(on || sid);
+    if (on && fit) setTimeout(() => { try { fit.fit(); } catch (_) {} }, 0);
+  }
+
+  async function killSession() {
+    const id = sid;
+    sid = null;
+    sessionStorage.removeItem("scanner-pty");
+    if (es) { try { es.close(); } catch (_) {} es = null; }
+    if (id) {
+      try { await post("close", { id }); } catch (_) {}
+    }
+    killBtn.hidden = true;
+    stat("");
+  }
+
+  function ensureTerm() {
+    if (term) return term;
+    term = new Terminal({
+      fontFamily: '"Cascadia Mono", Consolas, ui-monospace, monospace',
+      fontSize: 13, lineHeight: 1.15, cursorBlink: true, scrollback: 4000,
+      theme: {
+        background: "#080c11",
+        foreground: "#9ad8ff",           // light blue
+        cursor: "#ffffff",
+        cursorAccent: "#080c11",
+        selectionBackground: "rgba(255,255,255,0.32)",
+        selectionForeground: "#ffffff",
+        selectionInactiveBackground: "rgba(255,255,255,0.18)",
+        black: "#0a1218",
+        red: "#ff8a8a",
+        green: "#7dffb3",
+        yellow: "#ffe08a",
+        blue: "#7ec8ff",
+        magenta: "#d4a5ff",
+        cyan: "#9ad8ff",
+        white: "#ffffff",
+        brightBlack: "#4a6a80",
+        brightRed: "#ffb0b0",
+        brightGreen: "#a8ffd0",
+        brightYellow: "#fff0b0",
+        brightBlue: "#b8e4ff",
+        brightMagenta: "#e8c8ff",
+        brightCyan: "#c8ecff",
+        brightWhite: "#ffffff"
+      }
+    });
+    fit = new FitAddon.FitAddon();
+    term.loadAddon(fit);
+    term.open(document.getElementById("termhost"));
+    window.__term = term;   // debug handle (an id="term" div would shadow this name)
+    term.onData(d => { if (sid) post("input", { id: sid, data: b64(d), b64: true }); });
+    let rt = null;
+    new ResizeObserver(() => {
+      clearTimeout(rt);
+      rt = setTimeout(() => {
+        if (termwrap.hidden) return;
+        try { fit.fit(); } catch (_) { return; }
+        if (sid) post("resize", { id: sid, cols: term.cols, rows: term.rows });
+      }, 120);
+    }).observe(termwrap);
+    return term;
+  }
+
+  function attach(id, since) {
+    if (es) es.close();
+    es = new EventSource(API + "/api/pty/stream?id=" + encodeURIComponent(id) +
+                         "&since=" + (since || 0) + "&token=" + encodeURIComponent(TOKEN));
+    es.onmessage = ev => { if (ev.data) term.write(dec.decode(b64bytes(ev.data), { stream: true })); };
+    es.addEventListener("exit", () => {
+      stat("exited — pick a command to start again", true);
+      term.write("\r\n\x1b[2m[process exited]\x1b[0m\r\n");
+      es.close(); es = null; sid = null; sessionStorage.removeItem("scanner-pty");
+      killBtn.hidden = true;
+    });
+    es.onerror = () => stat("stream dropped", true);
+  }
+
+  async function openProc(name) {
+    ensureTerm();
+    showTerm(true, name);
+    try { fit.fit(); } catch (_) {}
+    // Replace, don't orphan: each open used to abandon the previous ConPTY
+    // (OpenConsole + grok) until PTY_MAX filled and nothing would start.
+    if (sid) {
+      stat("replacing previous terminal…");
+      await killSession();
+      showTerm(true, name);
+    }
+    stat(name === "grok" ? "starting grok → jwrangle…" : ("starting " + name + "…"));
+    term.reset();
+    const r = await post("open", { name, cols: term.cols || 80, rows: term.rows || 24 });
+    if (!r.ok) {
+      stat(r.error || "open failed", true);
+      term.write("\x1b[31m" + (r.error || "open failed") + "\x1b[0m\r\n");
+      killBtn.hidden = !sid;
+      return;
+    }
+    sid = r.id;
+    sessionStorage.setItem("scanner-pty", sid);
+    killBtn.hidden = false;
+    const label = name === "grok" ? (name + " · jwrangle · " + r.cwd) : (name + " · " + r.cwd);
+    stat(label);
+    attach(sid, 0);
+    term.focus();
+  }
+
+  killBtn.onclick = async () => {
+    await killSession();
+    showTerm(false);
+    inp.focus();
+  };
+
+  document.querySelector('[data-mode="cmd"]').onclick = () => {
+    showTerm(false);
+    // sid intentionally kept — reattach after board reload; kill stays visible
+    killBtn.hidden = !sid;
+    inp.focus();
+  };
+
+  /* ── boot: list allowlisted commands; default = grok → jwrangle resume ── */
+  (async function boot() {
+    const procs = document.getElementById("procs");
+    if (!SERVED) {
+      procs.innerHTML = '<button disabled title="open this page from the scanner server">grok</button>';
+      return;
+    }
+    let st = {};
+    try { st = await (await fetch(API + "/api/pty")).json(); } catch (e) { st = {}; }
+    if (!st.available) {
+      procs.innerHTML = '<button disabled>grok</button>';
+      stat(st.reason || "no pty support", true);
+      // fallback: cmd mode status only
+      try { send("status"); } catch (_) {}
+      return;
+    }
+    procs.innerHTML = "";
+    (st.commands || []).forEach(name => {
+      const b = document.createElement("button");
+      b.textContent = name;
+      b.onclick = () => openProc(name);
+      if (name === "grok") b.classList.add("on");
+      procs.appendChild(b);
+    });
+    const prior = sessionStorage.getItem("scanner-pty");
+    const live = (st.sessions || []).find(s => s.id === prior && s.alive);
+    if (live) {   // board reloaded — pick the same process back up, with scrollback
+      ensureTerm(); showTerm(true);
+      try { fit.fit(); } catch (_) {}
+      sid = live.id;
+      stat(live.name + " · reattached · jwrangle");
+      attach(sid, 0);
+      return;
+    }
+    // Prefer any live grok session owned by the server (same board family)
+    const liveGrok = (st.sessions || []).find(s => s.alive && s.name === "grok");
+    if (liveGrok) {
+      ensureTerm(); showTerm(true);
+      try { fit.fit(); } catch (_) {}
+      sid = liveGrok.id;
+      sessionStorage.setItem("scanner-pty", sid);
+      stat("grok · reattached · jwrangle");
+      attach(sid, 0);
+      return;
+    }
+    // Default open: grok resumes jwrangle (server forces -r day sid / -c + cwd)
+    if ((st.commands || []).includes("grok")) {
+      await openProc("grok");
+    } else {
+      try { send("status"); } catch (_) {}
+    }
+  })();
+
+  window.addEventListener("focus", () => { if (termwrap.hidden) inp.focus(); else if (term) term.focus(); });
+  // Don't steal focus into cmd input — grok is the default surface
+  if (!EMBED && termwrap.hidden) inp.focus();
+
+  /* ── path drop / parent postMessage: insert text, never open the file ── */
+  function shellQuote(p) {
+    const s = String(p || "");
+    if (!s) return "";
+    if (/[\s&<>|^()"]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+    return s;
+  }
+
+  function insertPath(path) {
+    const raw = String(path || "").trim();
+    if (!raw) return;
+    const text = shellQuote(raw);
+    if (!termwrap.hidden && term && sid) {
+      // Real PTY: type the path at the cursor (no Enter — user concatenates)
+      post("input", { id: sid, data: b64(text), b64: true });
+      try { term.focus(); } catch (_) {}
+      stat("path inserted");
+      return;
+    }
+    // cmd mode (or pty idle): splice into the input line
+    showTerm(false);
+    const start = inp.selectionStart != null ? inp.selectionStart : inp.value.length;
+    const end = inp.selectionEnd != null ? inp.selectionEnd : start;
+    const before = inp.value.slice(0, start);
+    const after = inp.value.slice(end);
+    const pad = before && !/\s$/.test(before) ? " " : "";
+    inp.value = before + pad + text + after;
+    const pos = (before + pad + text).length;
+    inp.focus();
+    try { inp.setSelectionRange(pos, pos); } catch (_) {}
+    stat("path inserted");
+  }
+
+  function extractPath(dt) {
+    if (!dt) return "";
+    try {
+      const custom = (dt.getData("application/x-artifact-path") || "").trim();
+      if (custom) return custom;
+    } catch (_) {}
+    let plain = "";
+    try { plain = (dt.getData("text/uri-list") || dt.getData("text/plain") || "").trim(); } catch (_) {}
+    if (plain) {
+      plain = plain.split(/\r?\n/).find(l => l && !l.startsWith("#")) || plain;
+      if (/^file:/i.test(plain)) {
+        try {
+          let u = decodeURIComponent(plain.replace(/^file:\/\//i, ""));
+          if (/^\/[A-Za-z]:/.test(u)) u = u.slice(1);
+          return u.replace(/\//g, "\\");
+        } catch (_) {}
+      }
+      if (/^[A-Za-z]:[\\/]/.test(plain) || plain.startsWith("\\\\") || plain.startsWith("/")) {
+        return plain.trim();
+      }
+    }
+    if (dt.files && dt.files.length) {
+      const f = dt.files[0];
+      if (f && f.path) return f.path; // WebView2 / desktop Chromium
+    }
+    return "";
+  }
+
+  function onDragOver(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    try { e.dataTransfer.dropEffect = "copy"; } catch (_) {}
+    document.body.classList.add("drop-path");
+  }
+  function onDragLeave(e) {
+    if (e.target === document.body || e.target === document.documentElement) {
+      document.body.classList.remove("drop-path");
+    }
+  }
+  function onDrop(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    document.body.classList.remove("drop-path");
+    const p = extractPath(e.dataTransfer);
+    if (p) insertPath(p);
+    // Never navigate / reopen the file
+  }
+
+  document.addEventListener("dragenter", onDragOver);
+  document.addEventListener("dragover", onDragOver);
+  document.addEventListener("dragleave", onDragLeave);
+  document.addEventListener("drop", onDrop);
+
+  window.addEventListener("message", (e) => {
+    const d = e.data;
+    if (!d || typeof d !== "object") return;
+    if (d.type === "artifact-insert-path" && d.path) insertPath(d.path);
+  });
+
+  /* Companion: title only until hover — skipped when ?embed=1 (board dock) */
+  (function companionTitleHover() {
+    if (EMBED) return;
+    const KEY = "artifact-scanner-companion-title-hover";
+    const root = document.documentElement;
+    // Default OFF = stay full (no disappear on launch).
+    function enabled() {
+      try {
+        const v = localStorage.getItem(KEY);
+        if (v === null || v === undefined || v === "") return false;
+        return v === "1" || v === "true" || v === "on";
+      } catch (_) { return false; }
+    }
+    function apply() { root.classList.toggle("cth-on", enabled()); }
+    apply();
+    window.addEventListener("storage", (e) => { if (e.key === KEY) apply(); });
+    setInterval(apply, 1500);
+    root.addEventListener("pointerenter", () => root.classList.add("cth-open"));
+    root.addEventListener("pointerleave", () => root.classList.remove("cth-open"));
+    document.body.addEventListener("pointerenter", () => root.classList.add("cth-open"));
+    document.body.addEventListener("pointerleave", (e) => {
+      if (e.relatedTarget && root.contains(e.relatedTarget)) return;
+      root.classList.remove("cth-open");
+    });
+    document.addEventListener("focusin", () => root.classList.add("cth-open"));
+    window.addEventListener("blur", () => root.classList.remove("cth-open"));
+  })();
+</script>
